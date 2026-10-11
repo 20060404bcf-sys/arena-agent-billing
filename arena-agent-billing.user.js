@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Arena Agent 计费指纹与自动筛选
 // @namespace    local.arena.billing
-// @version      0.6.5
-// @description  有思考立即停止并排除；无思考等待输出完成及本轮完整计价后识别模型，账单未齐保留会话。模型名称与等待阶段常驻显示；内嵌计费识别内核、固定目标名单和100条轮换探针，可导出原始费用。
+// @version      0.6.6
+// @description  有思考立即停止并排除；无思考拿到本轮完整计价即识别模型，账单未齐保留会话。模型名称与等待阶段常驻显示；内嵌计费识别内核、固定目标名单和100条轮换探针，可导出原始费用。
 // @match        https://arena.ai/*
 // @run-at       document-start
 // @grant        none
@@ -954,7 +954,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     "catalogRows": 466,
     "pricedRows": 366,
     "unpricedRows": 100,
-    "scriptVersion": "0.6.5"
+    "scriptVersion": "0.6.6"
   };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4094,7 +4094,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     run.reason = reason || 'PAUSED';
     run.pendingRound = 0;
     // Keep an unfinished round observable while paused; pending=false is not completion evidence.
-    if (run.rounds && run.rounds.outputComplete && run.rounds.billingReady) run.rounds.pending = false;
+    if (automationRoundJudgeable()) run.rounds.pending = false;
     if (notice) {
       run.notice = notice;
       automationNotify(notice);
@@ -4135,6 +4135,18 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
 
   function automationRoundPending() {
     return !!(run.rounds && typeof run.rounds === 'object' && run.rounds.pending === true);
+  }
+
+  /**
+   * ★ 用户口径（2026-10-11）：「一般来说，得到了计费，那就可以直接判断了。」
+   *
+   *   ⇒ 本轮「可判定」= **拿到了本轮自己消息的完整计价**（billingReady）。
+   *     Arena 的 turn-complete（outputComplete）只是加分证据，**不再是前置条件**。
+   *     真机反例（会话 01a129a6）：完成信号与计价都已到达，完成态却被一条迟到的连接收尾抹掉，
+   *     于是永久停在 WAIT_OUTPUT（该分支既无计时器也无出路），识别永不发生、模型名永远不出现。
+   */
+  function automationRoundJudgeable() {
+    return !!(run.rounds && typeof run.rounds === 'object' && run.rounds.billingReady === true);
   }
 
   function automationBillRows(json) {
@@ -4199,7 +4211,12 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         round.outputCostSerial = Number(run.costObservationSerial) || 0;
         round.messageIds = [...new Set([...(round.messageIds || []), ...(ctx.messageIds || []).map(String)])];
         automationSettleThinking('NORMAL_END');
-      } else {
+      } else if (round.outputComplete !== true) {
+        // ★ 迟到的中断信号（error/abort 包、缓冲溢出、连接被服务端收尾导致读流抛错）**不得撤销已成立的完成**。
+        //   完成态由 Arena 自己的 turn-complete 控制记录确立（start → finish → turn-complete；见 20-network.js），
+        //   之后的同轮 EOF/abort 只是连接收尾，不是「这轮没输出完」。
+        //   真机反例（2026-10-11）：trace 里先 "@STREAM_END…wait:billing"（完成），紧接着一条中断把它抹回
+        //   WAIT_OUTPUT —— WAIT_OUTPUT 没有计时器也没有出路，于是永久卡死、识别永不发生、拿不到模型名。
         round.outputComplete = false;
         automationMarkThinkingIncomplete(ctx.sid, 'STREAM_INTERRUPTED');
       }
@@ -4218,13 +4235,12 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
 
   function automationBillReady(evidence, ctx) {
     const round = run.rounds;
-    if (!round || !round.outputComplete) return false;
+    if (!round) return false;
     if (round.billingReady === true && ctx.kind !== 'COST' && ctx.kind !== 'COST_READ') return true;
     if (ctx.kind !== 'COST' && ctx.kind !== 'COST_READ') return false;
-    if ((Number(run.costObservationSerial) || 0) <= (Number(round.outputCostSerial) || 0)) return false;
-    if (ctx.costRequestedAt && ctx.costRequestedAt < round.outputEndedAt) return false;
     const rows = automationBillRows(evidence.json);
     const ids = round.messageIds || [];
+    // 归属：账单行必须属于**本轮自己的消息**（轮次开始时已记账的旧消息不算 ⇒ 见 baselineMessageIds）。
     if (!ids.length) return false;
     const complete = (row) => {
       if (!row || typeof row !== 'object') return false;
@@ -4241,7 +4257,15 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         && row.totalChargedUsd !== null && row.totalChargedUsd !== undefined && row.totalChargedUsd !== ''
         && Number.isFinite(Number(row.totalChargedUsd)) && Number(row.totalChargedUsd) >= 0;
     };
+    // ★ 用户口径（2026-10-11）：「一般来说，得到了计费，那就可以直接判断了。」
+    //   ⇒ 本轮自己消息的**完整计价**本身就是可判定证据，**不再要求先观测到 turn-complete**。
+    //     不完整/占位的账单（缺字段、输出价为 0、无 totalChargedUsd）仍一律不算数 —— 这是原有的完整计价判据。
     if (!ids.every((id) => rows.some(([rowId, row]) => rowId === id && complete(row)))) return false;
+    // 反旧读数：读盘点必须晚于本轮开始；观测到输出结束时用更严格的 outputEndedAt。
+    const freshAfter = Number(round.outputEndedAt) || Number(round.startedAt) || 0;
+    if (ctx.costRequestedAt && freshAfter && Number(ctx.costRequestedAt) < freshAfter) return false;
+    if (round.outputComplete === true && round.outputEndedAt
+      && (Number(run.costObservationSerial) || 0) <= (Number(round.outputCostSerial) || 0)) return false;
     round.billingReady = true;
     round.billedAt = Date.now();
     return true;
@@ -4252,12 +4276,14 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     run.reason = reason;
     run.policy = { decision: 'WAIT', reason, matchedKeys: [], completeCount: 0 };
     run.notice = reason === 'WAIT_OUTPUT'
-      ? '等待本轮输出完成；有思考会立即排除，无思考会等输出和计价到齐后识别模型。'
-      : '输出已完成，等待本轮消息的完整计价；暂不判定模型。';
+      ? '等待本轮消息的完整计价；有思考会立即排除，计价一到就识别模型。'
+      : '等待本轮消息的完整计价；暂不判定模型。';
     automationTrace(reason === 'WAIT_OUTPUT' ? 'wait:output' : 'wait:billing');
     // Read retries never become completion evidence. Continue polling the same
     // session at a bounded rate so delayed billing can finish without user action.
-    if (reason === 'WAIT_BILLING' && run.rounds) {
+    // ★ 口径（2026-10-11）：两种等待都要继续轮询计价 —— 「得到计费就判」要求主动去看账，
+    //   不能让 WAIT_OUTPUT 变成一条没有出路的死路（真机反例见 automationRoundJudgeable 注释）。
+    if (run.rounds) {
       run.rounds.billingReads = (Number(run.rounds.billingReads) || 0) + 1;
       automationScheduleCostRead(sid, Math.max(automationTiming.costGapMs, 2000));
     }
@@ -4435,7 +4461,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   /** Only a matching terminal output event plus fresh, complete current-message billing can settle. */
   function automationShouldSettleRound(ctx) {
     return (ctx.kind === 'COST' || ctx.kind === 'COST_READ') && automationRoundPending()
-      && run.rounds.outputComplete === true && run.rounds.billingReady === true;
+      && automationRoundJudgeable();
   }
 
   async function automationRunInner(ctx) {
@@ -4447,7 +4473,8 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     if (ctx.roundToken && ctx.roundToken !== eventRoundToken) return;
     if (ctx.kind === 'STREAM_END' && !ctx.streamRecorded) {
       if (ctx.normalEnd !== true || ctx.outputSeen !== true) {
-        automationMarkThinkingIncomplete(sid, 'STREAM_INTERRUPTED');
+        // 同 1300 行的守卫：已完成的轮次不被迟到的中断撤销。
+        if (run.rounds.outputComplete !== true) automationMarkThinkingIncomplete(sid, 'STREAM_INTERRUPTED');
         return;
       }
       if (sid !== run.sessionId || run.owned !== true) return;
@@ -4523,8 +4550,13 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         return;
       }
     }
-    if (!run.rounds || !run.rounds.outputComplete) { automationWaitForRound(sid, 'WAIT_OUTPUT'); return; }
-    if (!automationBillReady(evidence, ctx)) { automationWaitForRound(sid, 'WAIT_BILLING'); return; }
+    if (!run.rounds) { automationWaitForRound(sid, 'WAIT_OUTPUT'); return; }
+    // ★ 用户口径（2026-10-11）：「一般来说，得到了计费，那就可以直接判断了。」
+    //   ⇒ 计价齐了就判；拿不到完整计价才等（「等输出完成」只是其中一种情形，不再是唯一前置）。
+    if (!automationBillReady(evidence, ctx)) {
+      automationWaitForRound(sid, run.rounds.outputComplete === true ? 'WAIT_BILLING' : 'WAIT_OUTPUT');
+      return;
+    }
     const policy = automationPolicy(evidence.report, {});
     const gateOn = switches.fixedFilter === true;
     automationTrace(gateOn ? 'pool:gate' : 'pool:advisory');
@@ -5219,7 +5251,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   async function automationApplyPoolChange() {
     automationEnsureState();
     clearTimeout(roundTimer); roundTimer = null;
-    if (run.rounds && run.rounds.outputComplete && run.rounds.billingReady) run.rounds.pending = false;
+    if (automationRoundJudgeable()) run.rounds.pending = false;
     run.pendingRound = 0;
     run.poolChangeCount = (Number(run.poolChangeCount) || 0) + 1;
     // 池是本批锁定的两样东西之一 ⇒ 换池就换锁：**只重锁池，探针上限与 charged 上限原样不动**。
@@ -5248,7 +5280,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     clearTimeout(roundTimer); roundTimer = null;
     clearTimeout(costTimer); costTimer = null;
     clearTimeout(probeTimer); probeTimer = null;
-    if (run.rounds && run.rounds.outputComplete && run.rounds.billingReady) run.rounds.pending = false;
+    if (automationRoundJudgeable()) run.rounds.pending = false;
     run.pendingRound = 0;
     run.phase = 'PAUSED';
     run.reason = 'SWITCH_CHANGED';
@@ -6244,7 +6276,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     return [
       '筛选规则：',
       '  · 有思考：立即停止生成并排除当前会话。',
-      '  · 无思考：等输出完成和完整计价，再识别价格候选。',
+      '  · 无思考：等本轮完整计价，再识别价格候选。',
       '  · 命中目标价格候选时保留；完整证据未命中时归档。',
       '  · 计价暂未到时等待；证据仍不可用时暂停并保留当前会话。',
       '  · 同价模型无法区分，模型名称仅表示价格候选。',
@@ -6257,7 +6289,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
       TARGET_POOL_COPY.collapseLine,
       '筛选机制（固定）：',
       '有思考：立即停止生成并排除当前会话。',
-      '无思考：等输出完成和完整计价，再识别价格候选。',
+      '无思考：等本轮完整计价，再识别价格候选。',
       '计价尚未就绪时等待；证据仍不可用时暂停并保留。',
     ].join('\n');
   }
@@ -6734,7 +6766,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         <div class="modelstage">等待开始探测</div>
         <div class="modelnote">输出完成并取得完整计价后再识别。</div>
       </section>
-      <div class="mechanisms"><div>有思考：立即停止并排除</div><div>无思考：等输出完成和完整计价，再识别</div></div>
+      <div class="mechanisms"><div>有思考：立即停止并排除</div><div>无思考：等本轮完整计价，再识别</div></div>
       <p class="boundline">${TARGET_POOL_COPY.collapseLine}</p>
       <div class="body">
       <section class="sec poolbox">
@@ -7003,16 +7035,15 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     const sid = typeof currentSessionId === 'function' ? currentSessionId() : run.sessionId;
     const active = !!run.sessionId && (!sid || run.sessionId === sid);
     const round = active && run.rounds && typeof run.rounds === 'object' ? run.rounds : {};
-    const view = { title: '模型待识别', label: '当前会话', stage: '等待开始探测', ready: false, names: [], note: '输出完成并取得完整计价后再识别。', tone: 'waiting' };
+    const view = { title: '模型待识别', label: '当前会话', stage: '等待开始探测', ready: false, names: [], note: '拿到本轮完整计价就识别。', tone: 'waiting' };
     if (active && run.thinking && run.thinking.state === 'SEEN') {
       return Object.assign(view, { title: '思考已排除', stage: '检测到思考，立即停止并排除', note: '本次会话不再进入价格筛选。', tone: 'excluded' });
     }
-    if (active && !round.outputComplete) {
-      view.stage = '等待输出完成';
-      return view;
-    }
-    if (active && round.outputComplete && !round.billingReady) {
-      view.stage = run.phase === 'PAUSED' ? '计价未到，已暂停' : '等待本轮完整计价';
+    // ★ 用户口径（2026-10-11）：「得到了计费，那就可以直接判断了。」⇒ 唯一的等待条件是**计价未到**；
+    //   「输出未完成」不再是独立等待阶段（真机反例：完成态被迟到的连接收尾抹掉 ⇒ 永久显示「等待输出完成」）。
+    if (active && !round.billingReady) {
+      view.stage = run.phase === 'PAUSED' ? '计价未到，已暂停'
+        : (round.outputComplete ? '等待本轮完整计价' : '等待本轮输出与完整计价');
       return view;
     }
     const src = typeof identifyView === 'object' && identifyView ? identifyView.source : null;
@@ -7384,15 +7415,16 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     const currentRun = typeof run === 'object' && run && run.owned === true && run.sessionId === currentSessionId();
     const round = currentRun && run.rounds && typeof run.rounds === 'object' ? run.rounds : null;
     const thinkingSeen = currentRun && run.thinking && run.thinking.state === 'SEEN';
-    if (thinkingSeen || (round && (!round.outputComplete || !round.billingReady))) {
-      let stage = thinkingSeen ? '检测到思考，立即停止并排除' : !round.outputComplete ? '等待输出完成' : '等待本轮完整计价';
+    if (thinkingSeen || (round && !round.billingReady)) {
+      let stage = thinkingSeen ? '检测到思考，立即停止并排除'
+        : (round.outputComplete ? '等待本轮完整计价' : '等待本轮输出与完整计价');
       try {
         if (typeof panelV2ModelView === 'function') {
           const model = panelV2ModelView();
           if (model && typeof model.stage === 'string') stage = model.stage;
         }
       } catch (_) {}
-      panel.identify.textContent = '识别：' + stage + (thinkingSeen ? '\n本次会话不再进入价格筛选。' : '\n输出完成并取得本轮完整计价后，再显示价格候选。');
+      panel.identify.textContent = '识别：' + stage + (thinkingSeen ? '\n本次会话不再进入价格筛选。' : '\n拿到本轮完整计价就显示价格候选。');
       return;
     }
     const tail = [];
