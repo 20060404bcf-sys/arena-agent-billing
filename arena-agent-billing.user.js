@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Arena Agent 计费指纹与自动筛选
 // @namespace    local.arena.billing
-// @version      0.6.6
-// @description  有思考立即停止并排除；无思考拿到本轮完整计价即识别模型，账单未齐保留会话。模型名称与等待阶段常驻显示；内嵌计费识别内核、固定目标名单和100条轮换探针，可导出原始费用。
+// @version      0.6.7
+// @description  默认强制注入计费覆盖开关（localStorage+cookie+posthog，绕过 /cost 403；读到 403 自动重放开关重试一次）；有思考立即停止并排除；无思考拿到本轮完整计价即识别模型，账单未齐保留会话。模型名称与等待阶段常驻显示；内嵌计费识别内核、固定目标名单和100条轮换探针，可导出原始费用。
 // @match        https://arena.ai/*
 // @run-at       document-start
 // @grant        none
@@ -954,7 +954,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     "catalogRows": 466,
     "pricedRows": 366,
     "unpricedRows": 100,
-    "scriptVersion": "0.6.6"
+    "scriptVersion": "0.6.7"
   };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1460,6 +1460,19 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   // __IDENTIFY_BLOCK_END__
   const STORAGE = 'arena-agent-billing:userscript:v2';
   const FLAG_COOKIE = 'ph-toolbar-overrides';
+  // ★ 强制注入覆盖开关（用户 2026-10-11 指令「默认强制注入覆盖脚本，这样绕过 403 读取 cost」）：
+  //   把「覆盖脚本」做的事内置成**默认行为**。机制（见项目根 STATUS.md 第五节，已在真机验证）：
+  //     localStorage["ph_phc_*_posthog"].$override_feature_flags = {"credit-system-m1":"cost-shown"}
+  //         ↓ 前端 usePostHogToolbarSync 派生
+  //     cookie ph-toolbar-overrides
+  //         ↓ 服务端逐请求读它
+  //     GET /api/chat/<sid>/cost ⇒ 200（开关丢失/被页面刷新清掉 ⇒ 立刻退回 403 Unauthorized）
+  //   两个真源都要写：localStorage 是扛重载的那个，cookie 是服务端读的那个。
+  const FLAG_LOCAL_KEY = /^ph_phc_.*_posthog$/;
+  const FLAG_MAX_AGE_S = 2592000;      // 30 天（与 recon/restore-flag-and-probe.py 的手工恢复脚本一致）
+  const FLAG_WATCH_MS = 10000;         // 自愈周期：只读本地状态，缺了才补写，不发任何网络请求
+  const FLAG_PUSH_TICKS = 12;          // 前 12 个周期（≈2 分钟）反复把覆盖推给 PostHog 实例，之后只在被清掉时补推
+  const BILLING_FLAG = { key: 'credit-system-m1', value: 'cost-shown' };
   const MIN_COST_GAP_MS = 4000;
   const PROBE_RETRY_GAP_MS = 6000;
   const DEFAULT_TASK = '请用一句话回答：1+1 等于多少？';
@@ -1518,6 +1531,10 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   let probeTimer = null;
   let panel = null;
   let automationToken = 0;
+  // 覆盖开关自愈周期（见 20-network.js startBillingFlagWatchdog）：
+  //   flagWatchTimer = 定时器句柄；flagWatchTicks = 已跑周期数（决定还要不要继续推 PostHog 实例）。
+  let flagWatchTimer = null;
+  let flagWatchTicks = 0;
   // 顶部先抓住原生 fetch：installNetworkHooks() 会把 window.fetch 包掉，
   // 而费用读数要用**没被包的**那个，免得自己的只读请求被钩子记进筛选状态。
   // （installNetworkHooks 里那个 const nativeFetch 是函数内作用域，外面看不见。）
@@ -2079,16 +2096,116 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     return encodeURIComponent(JSON.stringify(value));
   }
 
-  // 只设置页面声明的 override，不删除 localStorage，也不清理用户其它状态。
-  function enableBillingFlag() {
-    let overrides = {};
+  // ═══════════════════════════════════════════════════════════════════════════
+  // 覆盖开关（拿计费数据的前提）—— 0.6.7 起**默认强制注入**，不再等用户点面板上的
+  // 「覆盖开关没生效，点这里恢复」，也不再只在 /agent 页面写一次 cookie。
+  //
+  // 为什么原来是坏的：只写 cookie ⇒ 页面自己的 PostHog toolbar sync 会按
+  // localStorage[ph_phc_*_posthog].$override_feature_flags 重新派生 cookie；
+  // localStorage 里没有覆盖时派生结果里就没有这个开关 ⇒ 开关被清掉 ⇒ /cost 退回
+  // 403 {"error":"Unauthorized"}（真机实测，见 STATUS.md 第四节/第五节）。
+  // 现在三处一起写：① localStorage（真源，扛重载）② cookie（服务端读的那个）
+  // ③ posthog 实例（晚于 document-start 出现 ⇒ 由自愈周期补推）。
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /** 读 cookie 里现有的 override 对象（解析不了就当空，绝不抛、绝不删用户其它状态）。 */
+  function cookieOverrides() {
     const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + FLAG_COOKIE + '=([^;]*)'));
-    if (m) {
-      try { overrides = JSON.parse(decodeURIComponent(m[1])); } catch (_) { overrides = {}; }
+    if (!m) return {};
+    try {
+      const parsed = JSON.parse(decodeURIComponent(m[1]));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+      return {};
     }
-    overrides['credit-system-m1'] = 'cost-shown';
-    document.cookie = FLAG_COOKIE + '=' + encodeCookieValue(overrides) + '; path=/; max-age=604800; SameSite=Lax';
-    window.__ARENA_BILLING_FLAG_OVERRIDE__ = 'credit-system-m1=cost-shown';
+  }
+
+  /** cookie 里的开关是否已是目标值（自愈周期只读判断，不发请求）。 */
+  function billingFlagCookieApplied() {
+    return cookieOverrides()[BILLING_FLAG.key] === BILLING_FLAG.value;
+  }
+
+  /** ① localStorage 的真源键名（带项目 token，首访/未初始化时可能还没有 ⇒ 返回 null，交给自愈重试）。 */
+  function billingFlagLocalStorageKey() {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && FLAG_LOCAL_KEY.test(key)) return key;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function writeBillingFlagLocalStorage() {
+    const key = billingFlagLocalStorageKey();
+    if (!key) return false;
+    let data = {};
+    try { data = JSON.parse(localStorage.getItem(key) || '{}'); } catch (_) { data = {}; }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) data = {};
+    const current = Object.assign({}, data.$override_feature_flags || {});
+    if (current[BILLING_FLAG.key] === BILLING_FLAG.value) return true;
+    current[BILLING_FLAG.key] = BILLING_FLAG.value;
+    data.$override_feature_flags = current;
+    try { localStorage.setItem(key, JSON.stringify(data)); return true; } catch (_) { return false; }
+  }
+
+  /** ② cookie：服务端逐请求读它；已是对的就原样返回，不无谓重写（避免每周期都写一次 Set-Cookie）。 */
+  function writeBillingFlagCookie() {
+    const overrides = cookieOverrides();
+    if (overrides[BILLING_FLAG.key] === BILLING_FLAG.value) return true;
+    overrides[BILLING_FLAG.key] = BILLING_FLAG.value;
+    document.cookie = FLAG_COOKIE + '=' + encodeCookieValue(overrides)
+      + '; path=/; max-age=' + FLAG_MAX_AGE_S + '; SameSite=Lax';
+    return true;
+  }
+
+  /** ③ 让页面自己的 PostHog 认一次覆盖（否则 toolbar sync 会按远端 flags 再覆盖回去）。 */
+  function applyBillingFlagToPosthog() {
+    try {
+      const ph = window.posthog;
+      if (ph && ph.featureFlags && typeof ph.featureFlags.override === 'function') {
+        ph.featureFlags.override({ [BILLING_FLAG.key]: BILLING_FLAG.value });
+        return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  /**
+   * 强制注入覆盖开关：localStorage + cookie + posthog 实例一起写。
+   * **默认行为**（bootstrap 在任意 arena.ai 页面的 document-start 就调用），也是 403 重试
+   * 与面板「恢复」按钮的同一个入口。返回状态对象便于控制台/面板复核；任何一步失败都不抛。
+   */
+  function enableBillingFlag() {
+    const local = writeBillingFlagLocalStorage();
+    const cookie = writeBillingFlagCookie();
+    const posthog = applyBillingFlagToPosthog();
+    const state = { local, cookie, posthog, at: Date.now() };
+    window.__ARENA_BILLING_FLAG_OVERRIDE__ = BILLING_FLAG.key + '=' + BILLING_FLAG.value;
+    window.__ARENA_BILLING_FLAG_STATE__ = state;
+    return state;
+  }
+
+  /**
+   * 覆盖开关自愈：PostHog toolbar sync / 页面脚本随时可能把 cookie 或 localStorage 覆盖清掉。
+   * 固定周期只读本地状态，缺了才补写（无网络请求、无面板、不影响筛选）。
+   * PostHog 实例只在「启动后的头 2 分钟」或「cookie 刚被清掉」时推一次 —— 避免每 10 秒
+   * 触发一次 PostHog 的 feature flag 重取。
+   */
+  function startBillingFlagWatchdog() {
+    if (flagWatchTimer !== null) return flagWatchTimer;
+    flagWatchTimer = setInterval(() => {
+      try {
+        flagWatchTicks += 1;
+        const local = writeBillingFlagLocalStorage();
+        const hadCookie = billingFlagCookieApplied();
+        const cookie = hadCookie ? true : writeBillingFlagCookie();
+        const push = flagWatchTicks <= FLAG_PUSH_TICKS || !hadCookie;
+        const posthog = push ? applyBillingFlagToPosthog() : false;
+        window.__ARENA_BILLING_FLAG_STATE__ = { local, cookie, posthog, at: Date.now(), tick: flagWatchTicks };
+      } catch (_) {}
+    }, FLAG_WATCH_MS);
+    return flagWatchTimer;
   }
 
   function currentSessionId() {
@@ -2981,10 +3098,19 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     // 只读：GET /api/chat/<sid>/cost（与页面自己用的同一个端点，不写任何东西）。
     // 用 nativeFetch（顶部抓到的原生 fetch）⇒ 自己的只读请求不会被网络钩子当成页面回调，
     // 避免「读一次 → 钩子回调 → 再读一次」的回环。
-    const response = await nativeFetch(`/api/chat/${encodeURIComponent(sid)}/cost?includeSession=true`, { credentials: 'same-origin' });
-    let text = '';
-    try { text = await response.text(); } catch (_) { text = ''; }
-    return { ok: !!response.ok, status: response.status, text };
+    const automationCostRead = async () => {
+      const response = await nativeFetch(`/api/chat/${encodeURIComponent(sid)}/cost?includeSession=true`, { credentials: 'same-origin' });
+      let text = '';
+      try { text = await response.text(); } catch (_) { text = ''; }
+      return { ok: !!response.ok, status: response.status, text };
+    };
+    const first = await automationCostRead();
+    // ★ 0.6.7（用户指令 2026-10-11）：403 是「覆盖开关没生效」的签名 ⇒ 强制重放覆盖开关
+    //   （localStorage + cookie + posthog）后**再读一次**，不必等用户手动干预。
+    //   仍然 403 就照实返回：只重试一次，不循环、不放大请求量（/cost 会 429）。
+    if (first.status !== 403) return first;
+    enableBillingFlag();
+    return automationCostRead();
   };
   let automationArchiveAndVerify = (sid, options) => archiveAndVerify(sid, options);
   let automationSendText = (text) => sendText(text);
@@ -7458,7 +7584,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   const costView = {
     timer: null, lastPath: null, busy: false, last: null, err: null,
     running: false, generation: 0, controller: null, timeout: null,
-    status: 'idle', updatedAt: null, listeners: false
+    status: 'idle', updatedAt: null, listeners: false, flagRetried: false
   };
   function literalsAsStrings(node) {
     return JSON.parse(JSON.stringify(node).replace(/:(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g, ':"$1"'));
@@ -7574,6 +7700,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     if (!sid) lines.push('请打开具体的 Agent 会话；没有会话不表示费用为零。');
     else {
       if (err) lines.push(err);
+      if (err && costView.flagRetried) lines.push('已自动重放覆盖开关（credit-system-m1=cost-shown）并重试 1 次。');
       if (!last) lines.push('实际成本：未知\n用户扣费：未知');
       else {
         const s = last.raw.session || {}, a = s.aggregate || {}, act = a.actual || {};
@@ -7613,13 +7740,34 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     costView.timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 15000);
     renderCost();
     try {
-      const result = await readSessionCost(sid, controller.signal);
+      // ★ 0.6.7（用户指令 2026-10-11「默认强制注入覆盖脚本，这样绕过 403 读取 cost」）：
+      //   /cost 读到 403 ⇒ **强制重放覆盖开关**（localStorage + cookie + posthog）后重试一次。
+      //   用户既有经验是「403 直接覆盖脚本走一次就行」；这里把它变成默认自动行为，
+      //   不必再手点面板上的「覆盖开关没生效，点这里恢复」。最多重试一次（不放大请求量）。
+      costView.flagRetried = false;
+      let read = null;
+      let readError = null;
+      for (let attempt = 0; attempt < 2 && read === null; attempt++) {
+        try {
+          const result = await readSessionCost(sid, controller.signal);
+          read = result;
+        } catch (e) {
+          readError = e;
+          if (attempt === 0 && /\b403\b/.test(String((e && e.message) || ''))) {
+            costView.flagRetried = true;
+            enableBillingFlag();
+            continue;
+          }
+          break;
+        }
+      }
+      if (read === null) throw readError;
       if (generation !== costView.generation || controller.signal.aborted || currentSessionId() !== sid) return false;
-      costView.last = result;
+      costView.last = read;
       costView.updatedAt = Date.now();
       costView.err = null;
       costView.status = 'ready';
-      setIdentifySource(sid, result.text);
+      setIdentifySource(sid, read.text);
       success = true;
     } catch (e) {
       if (generation !== costView.generation || currentSessionId() !== sid) return false;
@@ -7686,9 +7834,15 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
 
   function bootstrap() {
     installNetworkHooks();
-    // 不在 battle/首页写 feature flag，也不注入自动化面板；油猴脚本只服务 Agent。
-    if (!/^\/agent(?:\/|$)/.test(location.pathname)) return;
+    // ★ 0.6.7（用户指令 2026-10-11「默认强制注入覆盖脚本，这样绕过 403 读取 cost」）：
+    //   覆盖开关**在任意 arena.ai 页面的 document-start 就强制注入**，并起一个自愈周期。
+    //   原来只在 /agent 页面写一次 cookie，且页面自己的 PostHog toolbar sync 会按
+    //   localStorage 重写这个 cookie ⇒ 开关被清掉 ⇒ /cost 退回 403。现在两个真源都写、
+    //   自愈补写；battle/首页同样只写开关（不建面板、不跑自动化）。
     enableBillingFlag();
+    startBillingFlagWatchdog();
+    // 不在 battle/首页注入自动化面板；油猴脚本的界面与筛选只服务 Agent。
+    if (!/^\/agent(?:\/|$)/.test(location.pathname)) return;
     automationWatchDomThinking();
     const ready = () => { if (!document.getElementById('__arena_agent_billing_panel__')) createPanel(); };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready, { once: true });
@@ -7718,6 +7872,13 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     },
     classify,
     enableBillingFlag,
+    // ★ 0.6.7：覆盖开关的只读复核入口（真机控制台可直接看三处是否都写上了）。
+    billingFlag: {
+      inject: enableBillingFlag,
+      watchdog: startBillingFlagWatchdog,
+      state: () => window.__ARENA_BILLING_FLAG_STATE__ || null,
+      cookie: () => document.cookie,
+    },
     // 内嵌内核识别（与 CLI 同源）：只读接口 + 纯函数，便于在页面控制台复核与自动化测试。
     identify: {
       build: __IDENTIFY_BUILD__,
