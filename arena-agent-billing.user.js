@@ -4281,9 +4281,10 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     automationTrace(reason === 'WAIT_OUTPUT' ? 'wait:output' : 'wait:billing');
     // Read retries never become completion evidence. Continue polling the same
     // session at a bounded rate so delayed billing can finish without user action.
-    // ★ 口径（2026-10-11）：两种等待都要继续轮询计价 —— 「得到计费就判」要求主动去看账，
-    //   不能让 WAIT_OUTPUT 变成一条没有出路的死路（真机反例见 automationRoundJudgeable 注释）。
-    if (run.rounds) {
+    // ★ 只对 WAIT_BILLING 排读：费用面板自己每 15s 读一次价（50-cost.js startCostReadout），
+    //   那次读数会走 onCost ⇒ 同一条判定链 ⇒ 「得到计费就判」不需要在这里额外轮询；
+    //   在 WAIT_OUTPUT 也排读会变成 ~2s 一轮的请求（真机已观察到 /cost 429 限流），得不偿失。
+    if (reason === 'WAIT_BILLING' && run.rounds) {
       run.rounds.billingReads = (Number(run.rounds.billingReads) || 0) + 1;
       automationScheduleCostRead(sid, Math.max(automationTiming.costGapMs, 2000));
     }
