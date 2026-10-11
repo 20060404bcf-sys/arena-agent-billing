@@ -18,12 +18,12 @@ https://raw.githubusercontent.com/20060404bcf-sys/arena-agent-billing/main/arena
 | 项 | 值 |
 |---|---|
 | `@version` | `0.6.6` |
-| 字节 | 467388 |
-| sha256 | `6cd1cea487ec90c6f81d86978caaed0fc0b8ad51a556a41c21c59ddea5d77c17` |
+| 字节 | 467525 |
+| sha256 | `988706c6f42eb4ffe5ba5df8bbf7f391ae87584aab5a7de4af93736a63d840b7` |
 | KERNEL_HASH | `1fe2bbf7849e8ffbad8a74b5ea4efad0d7977999bc15dc0c99593bc24f1a03f1` |
 | BUNDLE_HASH | `6cee163797e57b24f0f86ab215e7bbb461cb935006be45efb6be1b02f21993f6` |
 | RULE_VERSION | `identify-rules-v1` |
-| 发布提交 | `a80cd8af33f3156a50d43aadfa2cefaa944eec31` |
+| 发布提交 | `eeb49a438ddfa463c7ec3f794cf8363f84cf454a` |
 
 ## 0.6.6 相对上一版的行为变化
 
@@ -36,7 +36,9 @@ https://raw.githubusercontent.com/20060404bcf-sys/arena-agent-billing/main/arena
   缓冲溢出，都不再把输出完成态抹掉（三条路径汇流到同一处共享守卫）。**真机反例（会话 `01a129a6`）**：
   先 `@STREAM_END … wait:billing`（正常完成），紧接着一条连接收尾把它抹回 `WAIT_OUTPUT`，
   而该状态当时既无计时器也无出路 ⇒ 永久卡死、识别永不发生、面板上永远看不到反推出的模型名。
-- **等待不再是死路**：`WAIT_OUTPUT` 与 `WAIT_BILLING` 都按有界节奏继续轮询本轮计价，账单一到就判。
+  （同一会话的内核报告其实是 `UNIQUE-COMPLETE = qwen3-30b-a3b` —— 名字当时已经算出来了。）
+- **账单一到就判，等待不再是死路**：费用面板本身每 15 秒读一次价（该读数进入同一条判定链），
+  `WAIT_BILLING` 也仍按有界节奏轮询计价；**刻意不在 `WAIT_OUTPUT` 里另排 ~2 秒轮询**（真机已观察到 `/cost` 429 限流）。
 - **面板文案随口径更新**：等待阶段由「等待输出完成」改为「等待本轮输出与完整计价」/「等待本轮完整计价」。
 - **R1 未变**：会话**没有费用证据**时一律**暂停、绝不归档**。
 - **R2 未变**：页面出现 `thinking` ⇒ 立即中断并归档（判据是**页面 DOM**，不是流量）。
