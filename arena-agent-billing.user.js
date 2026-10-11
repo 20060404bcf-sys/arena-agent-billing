@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Arena Agent 计费指纹与自动筛选
 // @namespace    local.arena.billing
-// @version      0.6.3
-// @description  在 Arena Agent 页面内抓取账单/SSE，内嵌与 CLI 同源的识别内核（完整候选/未约束候选/同价碰撞/忽视无价行/长上下文受限），可导出原始 /cost 供离线复算；思考流恒定中断并归档（回退点 AUTOMATION_THINKING_ALWAYS_ARCHIVE=false）；无费用证据一律暂停、绝不归档；探针池 100 条开场语、轮内无放回、一轮用尽自动轮换（不再"耗尽即停"）；另附「当前会话费用」只读常驻读数（折叠态摘要也显示费用速览）。
+// @version      0.6.5
+// @description  有思考立即停止并排除；无思考等待输出完成及本轮完整计价后识别模型，账单未齐保留会话。模型名称与等待阶段常驻显示；内嵌计费识别内核、固定目标名单和100条轮换探针，可导出原始费用。
 // @match        https://arena.ai/*
 // @run-at       document-start
 // @grant        none
@@ -954,7 +954,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     "catalogRows": 466,
     "pricedRows": 366,
     "unpricedRows": 100,
-    "scriptVersion": "0.6.3"
+    "scriptVersion": "0.6.5"
   };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2203,7 +2203,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   function stopGeneration() {
     const button = [...document.querySelectorAll('button,[role="button"]')]
       .filter(isVisible)
-      .find((el) => /stop|停止|cancel generation|中止/.test(textOf(el)));
+      .find((el) => /stop|停止|cancel generation|中止/i.test(textOf(el)));
     if (button) { button.click(); return true; }
     return false;
   }
@@ -2712,34 +2712,116 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     }
   }
 
-  async function inspectStream(response, sid) {
-    try {
-      const clone = response.clone();
-      const reader = clone.body?.getReader();
-      if (!reader) return;
-      const decoder = new TextDecoder();
-      let buffer = '';
-      while (true) {
-        const part = await reader.read();
-        if (part.done) break;
-        buffer += decoder.decode(part.value, { stream: true });
-        const signal = scanThoughtSignals(buffer);
-        if (signal.detected) {
-          await reader.cancel();
-          onThought(sid, signal.markers);
-          return;
+  function streamPackets(frame) {
+    const data = String(frame || '').split(/\r?\n/).filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim()).join('\n');
+    if (!data || data === '[DONE]') return [];
+    let root;
+    try { root = JSON.parse(data); } catch (_) { return []; }
+    const packets = [];
+    const visit = (node, record, depth) => {
+      if (!node || typeof node !== 'object' || depth > 5) return;
+      if (Array.isArray(node.records)) {
+        for (const row of node.records) {
+          if (Array.isArray(row.headers) && row.headers.some((pair) => pair[0] === 'trigger-control' && pair[1] === 'turn-complete'))
+            packets.push({ type: 'turn-complete', seq: row.seq_num });
+          if (typeof row.body === 'string') {
+            try { visit(JSON.parse(row.body), row, depth + 1); } catch (_) {}
+          }
         }
-        if (buffer.length > 16000) buffer = buffer.slice(-8000);
+        return;
       }
-    } catch (_) {}
+      if (typeof node.type === 'string') {
+        packets.push(Object.assign({}, node, { seq: record && record.seq_num,
+          startedAt: node.messageMetadata && node.messageMetadata.timing && node.messageMetadata.timing.startedAt }));
+        return;
+      }
+      if (node.data && typeof node.data === 'object') visit(node.data, record, depth + 1);
+    };
+    visit(root, null, 0);
+    return packets;
   }
 
-  function observeResponse(url, response) {
-    const sid = sessionIdFromUrl(url) || currentSessionId();
+  async function inspectStream(response, sid, options) {
+    let reader;
+    let turn = null;
+    const realtime = !options || options.realtime !== false;
+    try {
+      const clone = response.clone();
+      reader = clone.body?.getReader();
+      if (!reader || !sid) return;
+      const decoder = new TextDecoder();
+      let buffer = '';
+      const consume = (frame) => {
+        for (const packet of streamPackets(frame)) {
+          automationStreamRecord(sid, packet.seq);
+          if (packet.type === 'start') {
+            const binding = automationStreamStart(sid, packet);
+            if (binding) turn = { binding, outputSeen: !!(turn && turn.binding.roundToken === binding.roundToken
+              && turn.binding.automationToken === binding.automationToken && turn.outputSeen), finishSeen: false, complete: false };
+            else turn = null;
+            continue;
+          }
+          if (!turn) continue;
+          // ★ 2026-10-11（用户权威口径）：**流量不再作为思考判据**，判据改为页面上真正渲染出来的
+          //   thinking 标签（见 30-automation.js 的 automationDomThinkingLabel）。
+          //   真机反例：同一条 assistant 消息里 7 个 reasoning 部件 text 全为空、页面不显示任何思考，
+          //   这里却会命中 reasoning-start ⇒ 误判「有思考」。而且当时会 return true 掐断流读取，
+          //   导致永远等不到 turn-complete（会话卡在「等待输出完成」、也拿不到计价与模型名）。
+          if (packet.type === 'text-delta' && typeof packet.delta === 'string' && packet.delta.length) turn.outputSeen = true;
+          if (packet.type === 'error' || packet.type === 'abort') {
+            automationStreamEvent(Object.assign({}, turn.binding, { kind: 'STREAM_END', normalEnd: false }));
+            turn = null;
+            continue;
+          }
+          if (packet.type === 'finish') {
+            const metadata = packet.messageMetadata || {};
+            const nodeId = metadata.nodeId || packet.messageId;
+            if (nodeId && !turn.binding.messageIds.includes(String(nodeId))) continue;
+            if (metadata.pending === true || /error|abort|cancel/i.test(String(packet.finishReason || ''))) continue;
+            turn.finishSeen = true;
+          }
+          // A realtime connection is not a turn: finish/text-end/EOF are insufficient.
+          // Arena's turn-complete control record must follow this round's own start and finish.
+          if ((packet.type === 'turn-complete' && turn.finishSeen) || (!realtime && packet.type === 'finish')) {
+            automationStreamEvent(Object.assign({}, turn.binding, { kind: 'STREAM_END', normalEnd: true,
+              outputSeen: turn.outputSeen, messageIds: turn.binding.messageIds }));
+            turn.complete = true;
+          }
+        }
+        return false;
+      };
+      while (true) {
+        const part = await reader.read();
+        buffer += decoder.decode(part.value || new Uint8Array(), { stream: !part.done });
+        const frames = buffer.split(/\r?\n\r?\n/);
+        buffer = frames.pop() || '';
+        for (const frame of frames) {
+          if (consume(frame)) { void reader.cancel().catch(() => {}); return; }
+        }
+        if (part.done) {
+          if (buffer && consume(buffer)) return;
+          if (turn && !turn.complete) automationStreamEvent(Object.assign({}, turn.binding, { kind: 'STREAM_END', normalEnd: false }));
+          break;
+        }
+        if (buffer.length > 1000000) {
+          if (turn) automationStreamEvent(Object.assign({}, turn.binding, { kind: 'STREAM_END', normalEnd: false }));
+          void reader.cancel().catch(() => {});
+          return;
+        }
+      }
+    } catch (_) {
+      if (turn) automationStreamEvent(Object.assign({}, turn.binding, { kind: 'STREAM_END', normalEnd: false }));
+    }
+  }
+
+  function observeResponse(url, response, request) {
+    const streamMatch = String(url || '').match(/\/realtime\/v1\/sessions\/([^/?#]+)\/out(?:[?#]|$)/);
+    const sid = streamMatch ? streamMatch[1] : sessionIdFromUrl(url) || currentSessionId();
     let mime = '';
     try { mime = response.headers.get('content-type') || ''; } catch (_) {}
     if (/event-stream/i.test(mime)) {
-      inspectStream(response, sid);
+      if (streamMatch) void inspectStream(response, sid, { realtime: true });
       return;
     }
     if (!COST_ROUTE.test(String(url))) return;
@@ -2749,7 +2831,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
       // 页面自己发的 /cost 响应也留一份原文给识别面板/导出（只认当前会话，见 setIdentifySource）。
       setIdentifySource(sid, text);
       const evidence = extractCost(text);
-      if (evidence) onCost(sid, evidence, { url: String(url), status: response.status });
+      if (evidence) onCost(sid, evidence, Object.assign({ url: String(url), status: response.status }, request || {}));
     }).catch(() => {});
   }
 
@@ -2758,8 +2840,9 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     window.fetch = function (...args) {
       const input = args[0];
       const url = typeof input === 'string' ? input : input?.url || '';
+      const request = { requestedAt: Date.now(), automationToken, roundToken: run.rounds && run.rounds.token };
       const promise = nativeFetch.apply(this, args);
-      promise.then((response) => observeResponse(url, response)).catch(() => {});
+      promise.then((response) => observeResponse(url, response, request)).catch(() => {});
       return promise;
     };
 
@@ -2767,6 +2850,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     const send = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (method, url) {
       this.__arenaBillingUrl = url;
+      this.__arenaBillingRequest = { requestedAt: Date.now(), automationToken, roundToken: run.rounds && run.rounds.token };
       return open.apply(this, arguments);
     };
     XMLHttpRequest.prototype.send = function () {
@@ -2774,8 +2858,9 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         const url = this.__arenaBillingUrl || '';
         if (!COST_ROUTE.test(String(url))) return;
         const text = this.responseType === '' || this.responseType === 'text' ? this.responseText : null;
+        if (typeof text === 'string') setIdentifySource(sessionIdFromUrl(url) || currentSessionId(), text);
         const evidence = text ? extractCost(text) : null;
-        if (evidence) onCost(sessionIdFromUrl(url) || currentSessionId(), evidence, { url: String(url), status: this.status });
+        if (evidence) onCost(sessionIdFromUrl(url) || currentSessionId(), evidence, Object.assign({ url: String(url), status: this.status }, this.__arenaBillingRequest || {}));
       });
       return send.apply(this, arguments);
     };
@@ -3679,7 +3764,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
       thinking: run.thinking ? {
         state: run.thinking.state, round: run.thinking.round,
         markers: Array.isArray(run.thinking.markers) ? run.thinking.markers.slice() : [],
-        // ★ R2：命中来源（'sse'）也写进留证 —— 「记录命中原文与来源」要能在证据里复核。
+        // ★ R2：命中来源（'dom' = 页面上的 thinking 标签）也写进留证 —— 「记录命中原文与来源」要能复核。
         source: typeof run.thinking.source === 'string' ? run.thinking.source : null,
       } : null,
       chargedUsd: Number(run.chargedUsd) || 0,
@@ -4008,7 +4093,8 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     run.phase = 'PAUSED';
     run.reason = reason || 'PAUSED';
     run.pendingRound = 0;
-    if (run.rounds && typeof run.rounds === 'object') run.rounds.pending = false;
+    // Keep an unfinished round observable while paused; pending=false is not completion evidence.
+    if (run.rounds && run.rounds.outputComplete && run.rounds.billingReady) run.rounds.pending = false;
     if (notice) {
       run.notice = notice;
       automationNotify(notice);
@@ -4051,13 +4137,132 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     return !!(run.rounds && typeof run.rounds === 'object' && run.rounds.pending === true);
   }
 
+  function automationBillRows(json) {
+    const raw = json && json.messages;
+    if (Array.isArray(raw)) return raw.map((row, i) => [String(row && (row.id || row.messageId) || '#' + i), row]);
+    return raw && typeof raw === 'object' ? Object.entries(raw) : [];
+  }
+
   function automationBeginRound(kind, index) {
     automationEnsureState();
-    run.rounds = { kind, index, pending: true, token: automationRoundToken(kind, index), startedAt: Date.now() };
+    run.roundSequence = (Number(run.roundSequence) || 0) + 1;
+    let baseline = null;
+    try { baseline = JSON.parse(automationCachedCostText(run.sessionId)); } catch (_) {}
+    run.rounds = {
+      kind, index, pending: true, token: automationRoundToken(kind, index) + '#' + automationToken + '#' + run.roundSequence,
+      afterSeq: run.streamWatermarks && run.streamWatermarks[run.sessionId],
+      startedAt: Date.now(), outputComplete: false, billingReady: false, messageIds: [],
+      baselineMessageIds: automationBillRows(baseline).map(([id]) => id), billingReads: 0,
+    };
     run.thinking = { state: 'PENDING', round: index, kind, markers: [], complete: true, since: Date.now() };
     run.generateWaits = 0;
+    run.refetchUsed = 0;
+    run.evidenceFinal = false;
     run.pendingRound = kind === 'TASK' ? index : 0;
     automationPersist();
+  }
+
+  // Arena's output connection persists across turns and may replay old records.
+  // A new message start binds its later packets to this exact run and round.
+  function automationStreamRecord(sid, seq) {
+    if (!sid || !Number.isFinite(Number(seq))) return;
+    if (!run.streamWatermarks || typeof run.streamWatermarks !== 'object') run.streamWatermarks = {};
+    run.streamWatermarks[sid] = Math.max(Number(run.streamWatermarks[sid]) || 0, Number(seq));
+  }
+
+  function automationStreamStart(sid, packet) {
+    if (!activeAutomation(automationToken) || !automationRoundPending()) return null;
+    if (!sid || (run.sessionId && sid !== run.sessionId) || (!run.sessionId && sid === run.previousSessionId)) return null;
+    const round = run.rounds;
+    const id = packet && packet.messageId;
+    const seq = Number(packet && packet.seq);
+    const oldIds = [...(round.baselineMessageIds || []), ...(run.settledMessageIds || [])];
+    if (!id || oldIds.includes(String(id))) return null;
+    // Sequence watermarks and known message IDs avoid assumptions about server/client clocks.
+    if (round.afterSeq !== undefined && Number.isFinite(seq) && seq <= Number(round.afterSeq)) return null;
+    if (round.outputComplete) return null;
+    round.streamSid = sid;
+    round.streamStarted = true;
+    round.messageIds = [...new Set([...(round.messageIds || []), String(id)])];
+    automationPersist();
+    return { sid, automationToken, roundToken: round.token, messageIds: round.messageIds.slice() };
+  }
+
+  function automationStreamEvent(ctx) {
+    const round = run.rounds;
+    if (!ctx || ctx.automationToken !== automationToken || !round || ctx.roundToken !== round.token) return false;
+    if (!ctx.sid || (run.sessionId && ctx.sid !== run.sessionId) || (round.streamSid && ctx.sid !== round.streamSid)) return false;
+    if (ctx.kind === 'STREAM_END') {
+      if (ctx.normalEnd === true && ctx.outputSeen === true) {
+        round.outputComplete = true;
+        round.outputEndedAt = Date.now();
+        round.outputCostSerial = Number(run.costObservationSerial) || 0;
+        round.messageIds = [...new Set([...(round.messageIds || []), ...(ctx.messageIds || []).map(String)])];
+        automationSettleThinking('NORMAL_END');
+      } else {
+        round.outputComplete = false;
+        automationMarkThinkingIncomplete(ctx.sid, 'STREAM_INTERRUPTED');
+      }
+      round.billingReady = false;
+    }
+    automationPersist();
+    if (run.owned && run.sessionId === ctx.sid) {
+      if (ctx.kind === 'STREAM_END' && round.outputComplete) {
+        clearTimeout(costTimer); costTimer = null;
+        automationScheduleCostRead(ctx.sid, 0);
+      }
+      void automationRun(Object.assign({}, ctx, { streamRecorded: true }));
+    }
+    return true;
+  }
+
+  function automationBillReady(evidence, ctx) {
+    const round = run.rounds;
+    if (!round || !round.outputComplete) return false;
+    if (round.billingReady === true && ctx.kind !== 'COST' && ctx.kind !== 'COST_READ') return true;
+    if (ctx.kind !== 'COST' && ctx.kind !== 'COST_READ') return false;
+    if ((Number(run.costObservationSerial) || 0) <= (Number(round.outputCostSerial) || 0)) return false;
+    if (ctx.costRequestedAt && ctx.costRequestedAt < round.outputEndedAt) return false;
+    const rows = automationBillRows(evidence.json);
+    const ids = round.messageIds || [];
+    if (!ids.length) return false;
+    const complete = (row) => {
+      if (!row || typeof row !== 'object') return false;
+      const actual = row.actual || row.costDetail || row.cost;
+      if (!actual || typeof actual !== 'object') return false;
+      return ['inputTokensCostUsd', 'cacheWriteTokensCostUsd', 'cacheReadTokensCostUsd', 'outputTokensCostUsd']
+        .every((key) => actual[key] !== null && actual[key] !== undefined && actual[key] !== ''
+          && Number.isFinite(Number(actual[key])) && Number(actual[key]) >= 0)
+        && row.basePriceUsd !== null && row.basePriceUsd !== undefined && row.basePriceUsd !== ''
+        && Number.isFinite(Number(row.basePriceUsd)) && Number(row.basePriceUsd) >= 0
+        // Visible output from these priced candidates must have an observed output charge.
+        // Zero is a legitimate cache/input value, but an output-zero placeholder is not final billing.
+        && Number(actual.outputTokensCostUsd) > 0
+        && row.totalChargedUsd !== null && row.totalChargedUsd !== undefined && row.totalChargedUsd !== ''
+        && Number.isFinite(Number(row.totalChargedUsd)) && Number(row.totalChargedUsd) >= 0;
+    };
+    if (!ids.every((id) => rows.some(([rowId, row]) => rowId === id && complete(row)))) return false;
+    round.billingReady = true;
+    round.billedAt = Date.now();
+    return true;
+  }
+
+  function automationWaitForRound(sid, reason) {
+    run.decision = 'WAIT';
+    run.reason = reason;
+    run.policy = { decision: 'WAIT', reason, matchedKeys: [], completeCount: 0 };
+    run.notice = reason === 'WAIT_OUTPUT'
+      ? '等待本轮输出完成；有思考会立即排除，无思考会等输出和计价到齐后识别模型。'
+      : '输出已完成，等待本轮消息的完整计价；暂不判定模型。';
+    automationTrace(reason === 'WAIT_OUTPUT' ? 'wait:output' : 'wait:billing');
+    // Read retries never become completion evidence. Continue polling the same
+    // session at a bounded rate so delayed billing can finish without user action.
+    if (reason === 'WAIT_BILLING' && run.rounds) {
+      run.rounds.billingReads = (Number(run.rounds.billingReads) || 0) + 1;
+      automationScheduleCostRead(sid, Math.max(automationTiming.costGapMs, 2000));
+    }
+    automationPersist();
+    save();
   }
 
   function automationRecordThoughtMarkers(markers, source) {
@@ -4067,11 +4272,71 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     const thinking = run.thinking;
     thinking.markers = [...new Set([...(thinking.markers || []), ...list])];
     thinking.state = 'SEEN';
-    // ★ R2：如实记录命中来源（本版只有 SSE 通道；DOM 文本通道未实现 —— 见报告残余风险）。
+    // ★ R2：如实记录命中来源（'dom' = 页面上真正渲染出来的 thinking 标签，本版唯一通道）。
     if (typeof source === 'string' && source) thinking.source = source;
     thinking.seenAt = Date.now();
     thinking.lastEventAt = Date.now();
     automationPersist();
+  }
+
+  /**
+   * ★★ DOM 判据（用户 2026-10-11 权威口径，取代流量判据）
+   *
+   *   用户原话：「我能看到的，是浏览器页面上面的……如果抽到了模型，而且它有思考，
+   *             就会真正显示出 Thinking 这个词。应该检查的是这个，而不是它的流量。」
+   *            「思考完了会有 thought for n second；思考时会是 thinking，
+   *              在出现 thinking 的时候就可以截断。」
+   *
+   * ⇒ 判据 = **页面上真正渲染出来的** thinking 标签（思考卡片按钮上的那行字）。
+   *   流量里的 reasoning/thinking/thought 事件**不再作为判据**（20-network.js 已撤掉该分支）。
+   *   真机反例（本机 2026-10-11 实测）：同一条 assistant 消息里 **7 个 reasoning 部件 text 全为空**、
+   *   页面上不显示任何思考，SSE 却照发 reasoning-start ⇒ 按流量判会把这轮误归档；
+   *   而且当时会顺手掐断流读取，永远等不到 turn-complete（会话卡在「等待输出完成」，拿不到计价与模型名）。
+   */
+  const AUTOMATION_DOM_THINKING_RE = /^thinking\b/i;
+
+  /** 读页面上思考卡片的标签：命中 = 正在思考；null = 页面上没有正在进行的思考。 */
+  function automationDomThinkingLabel() {
+    let nodes;
+    try { nodes = document.querySelectorAll('[data-agent-transcript-message] button'); }
+    catch (_) { return null; }
+    for (const node of nodes) {
+      const text = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text && text.length <= 40 && AUTOMATION_DOM_THINKING_RE.test(text)) return text;
+    }
+    return null;
+  }
+
+  let domThinkingObserver = null;
+  let domThinkingSweepAt = 0;
+  let domThinkingHits = 0;
+
+  /** 只有「本会话 + 本轮 + 还没判过」才把页面命中的 thinking 交给同一条决策链（onThought）。 */
+  function automationSweepDomThinking() {
+    const now = Date.now();
+    if (now < domThinkingSweepAt) return;                 // 转录区每帧都在变，扫得太勤没必要
+    domThinkingSweepAt = now + 100;
+    if (!activeAutomation(automationToken)) return;
+    if (run.owned !== true || !['PROBING', 'RUNNING'].includes(run.phase)) return;
+    const sid = run.sessionId;
+    if (!sid || currentSessionId() !== sid) return;        // 页面必须停在本轮会话上，否则是旧转录
+    if (!run.rounds || run.rounds.pending !== true) return;
+    if (run.thinking && run.thinking.state === 'SEEN') return;
+    const label = automationDomThinkingLabel();
+    if (!label) return;
+    domThinkingHits += 1;
+    automationTrace('dom:thinking');
+    onThought(sid, ['dom:' + label], 'dom');
+  }
+
+  /** 装一次页面观察器（脚本在 /agent 页启动时装；60-bootstrap.js 调用）。 */
+  function automationWatchDomThinking() {
+    if (domThinkingObserver || typeof MutationObserver !== 'function' || !document.documentElement) return;
+    domThinkingObserver = new MutationObserver(() => {
+      try { automationSweepDomThinking(); } catch (_) {}
+    });
+    domThinkingObserver.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+    automationSweepDomThinking();
   }
 
   /** 结算观测：正常结束且观测完整 ⇒ NOT_SEEN；否则 UNKNOWN（**不猜**）。 */
@@ -4167,28 +4432,31 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     return { total, chargedUsd: Number(run.chargedUsd) || 0 };
   }
 
-  /** 本轮是否"正常结束"：只有 /cost 回调证明结算、且页面上已经不在生成，才算结算。 */
+  /** Only a matching terminal output event plus fresh, complete current-message billing can settle. */
   function automationShouldSettleRound(ctx) {
-    if (ctx.kind !== 'COST' && ctx.kind !== 'COST_READ') return false;
-    if (!automationRoundPending()) return false;
-    if (automationIsGenerating()) {
-      run.generateWaits = (Number(run.generateWaits) || 0) + 1;
-      if (run.generateWaits <= automationTiming.generateWaitMax) {
-        automationTrace('settle:still-generating');
-        return false;
-      }
-      run.generateWaits = 0;
-      run.thinking = Object.assign({}, run.thinking, { complete: false, incompleteReason: 'STILL_GENERATING' });
-      automationTrace('settle:generating-timeout');
-      return true;
-    }
-    run.generateWaits = 0;
-    return true;
+    return (ctx.kind === 'COST' || ctx.kind === 'COST_READ') && automationRoundPending()
+      && run.rounds.outputComplete === true && run.rounds.billingReady === true;
   }
 
   async function automationRunInner(ctx) {
     const sid = ctx.sid;
+    const eventToken = automationToken;
+    const eventRoundToken = run.rounds && run.rounds.token;
     automationEnsureState();
+    if (ctx.automationToken !== undefined && ctx.automationToken !== eventToken) return;
+    if (ctx.roundToken && ctx.roundToken !== eventRoundToken) return;
+    if (ctx.kind === 'STREAM_END' && !ctx.streamRecorded) {
+      if (ctx.normalEnd !== true || ctx.outputSeen !== true) {
+        automationMarkThinkingIncomplete(sid, 'STREAM_INTERRUPTED');
+        return;
+      }
+      if (sid !== run.sessionId || run.owned !== true) return;
+      run.rounds.outputComplete = true;
+      run.rounds.outputEndedAt = Date.now();
+      run.rounds.outputCostSerial = Number(run.costObservationSerial) || 0;
+      run.rounds.messageIds = [...new Set([...(run.rounds.messageIds || []), ...(ctx.messageIds || []).map(String)])];
+      automationSettleThinking('NORMAL_END');
+    }
     automationTrace(`@${ctx.trigger || ctx.kind || 'EVENT'}`);
     automationTrace('constraints');
     if (!activeAutomation(automationToken)) { automationTrace('abort:inactive'); return; }
@@ -4218,15 +4486,18 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     let status = ctx.status === undefined ? null : ctx.status;
     let collected = null;
     if (ctx.kind === 'COST_READ') {
+      ctx.costRequestedAt = Date.now();
       collected = await automationCollectEvidence(sid, { fetch: true });
       if (collected.json) {
         try { charge = extractCost(collected.text) || charge; } catch (_) {}
       }
       status = collected.status;
-      if (!activeAutomation(automationToken)) return;
+      if (eventToken !== automationToken || !activeAutomation(eventToken)) return;
+      if (eventRoundToken !== (run.rounds && run.rounds.token)) { automationTrace('ignore:round-changed'); return; }
       if (sid !== run.sessionId || run.owned !== true) { automationTrace('ignore:session-changed'); return; }
     }
     if (ctx.kind === 'COST' || ctx.kind === 'COST_READ') {
+      run.costObservationSerial = (Number(run.costObservationSerial) || 0) + 1;
       automationRecordCost(sid, charge, status);
     }
     if (ctx.kind === 'THOUGHT') automationRecordThoughtMarkers(ctx.markers, ctx.source);
@@ -4235,6 +4506,25 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     const switches = automationSwitches();
     run.switches = switches;
     const evidence = collected || await automationCollectEvidence(sid, { fetch: false });
+    if (eventToken !== automationToken || eventRoundToken !== (run.rounds && run.rounds.token)
+      || sid !== run.sessionId || run.owned !== true || automationSidTerminated(sid) || run.phase === 'ARCHIVING'
+      || (run.phase === 'PAUSED' && ctx.allowPaused !== true)) return;
+    // Positive thinking evidence is the only immediate exclusion. Every price
+    // decision, name change and subsequent task must pass the same completion gate.
+    if (run.thinking.state === 'SEEN') {
+      const thinking = automationThinkingDecision({ fixedFilter: switches.fixedFilter, thinkingMode: switches.thinkingMode, thinking: run.thinking });
+      run.thinkingDecision = { action: thinking.action, reason: thinking.reason, state: thinking.state,
+        markers: automationThinkingHitDetail(run.thinking).markers, source: automationThinkingHitDetail(run.thinking).source };
+      if (thinking.stopGeneration) automationStopGeneration();
+      if (thinking.action === 'archive') {
+        automationTrace('decide:archive');
+        await automationArchiveSession(sid, { sid, trigger: ctx.trigger || ctx.kind,
+          report: evidence.report, evidence, switches, policy: null, reason: thinking.reason, thinking: thinking.state });
+        return;
+      }
+    }
+    if (!run.rounds || !run.rounds.outputComplete) { automationWaitForRound(sid, 'WAIT_OUTPUT'); return; }
+    if (!automationBillReady(evidence, ctx)) { automationWaitForRound(sid, 'WAIT_BILLING'); return; }
     const policy = automationPolicy(evidence.report, {});
     const gateOn = switches.fixedFilter === true;
     automationTrace(gateOn ? 'pool:gate' : 'pool:advisory');
@@ -4403,13 +4693,20 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         run.hitCount = run.hitSids.length;
       }
     }
+    const keepToken = automationToken;
+    const keepRound = run.rounds && run.rounds.token;
     const naming = await automationApplyNaming(sid, ctxForAction, 'KEEP');
+    if (keepToken !== automationToken || keepRound !== (run.rounds && run.rounds.token)
+      || sid !== run.sessionId || !run.owned || !['RUNNING', 'PROBING'].includes(run.phase)) return { advanced: false, naming };
     if (!settled) { automationTrace('keep:no-round-advance'); return { advanced: false, naming }; }
     const block = automationAutoSendBlock();
     if (block) { automationStopBatch(block); return { advanced: false, naming, stopped: block }; }
     const token = automationRoundPending() ? run.rounds.token : null;
     if (token === null) { automationTrace('keep:round-already-settled'); return { advanced: false, naming }; }
-    if (run.rounds) run.rounds.pending = false;
+    if (run.rounds) {
+      run.rounds.pending = false;
+      run.settledMessageIds = [...new Set([...(run.settledMessageIds || []), ...(run.rounds.messageIds || [])])];
+    }
     const total = Math.max(0, Math.floor(automationNumber(config.rounds, 0) || 0));
     run.phase = 'RUNNING';
     run.reason = null;
@@ -4452,6 +4749,8 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     const token = automationToken;
     if (!activeAutomation(token)) return { archived: false, stopped: 'INACTIVE' };
     if (automationSidTerminated(sid)) return { archived: false, stopped: 'TERMINATED' };
+    if (sid !== run.sessionId || run.owned !== true) return { archived: false, stopped: 'NOT_OWNED' };
+    if (run.phase === 'ARCHIVING') return { archived: false, stopped: 'ALREADY_ARCHIVING' };
     const context = ctxForAction && typeof ctxForAction === 'object' ? ctxForAction : {};
     const switches = automationSwitches();
     const candidates = automationNameCandidates(context.report, {
@@ -4576,9 +4875,16 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     if (run.sessionName && run.sessionName.key === key) {
       return { applied: false, skipped: 'IDEMPOTENT', name };
     }
+    const namingToken = automationToken;
+    const namingRound = run.rounds && run.rounds.token;
+    // Reserve this key before awaiting the UI/API rename to prevent duplicate writes.
+    run.sessionName = { key, name, at: Date.now(), ok: null, pending: true };
     let ok = null;
     try { ok = await automationRename(name); }
     catch (error) { ok = false; run.notice = `改名失败（${String((error && error.message) || error)}），只提示，不影响保留/归档决策`; }
+    if (namingToken !== automationToken || namingRound !== (run.rounds && run.rounds.token)
+      || sid !== run.sessionId || run.owned !== true || !['PROBING', 'RUNNING'].includes(run.phase))
+      return { applied: false, skipped: 'STATE_CHANGED', name };
     run.sessionName = { key, name, at: Date.now(), ok: ok !== false };
     if (ok === false && !run.notice) run.notice = `改名失败（${name}），只提示，不影响保留/归档决策`;
     automationPersist();
@@ -4766,6 +5072,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     }
     run.probeId = selected.probeId;
     run.probeIndex = selected.index;
+    automationBeginRound('PROBE', 0);
     const sent = await automationSendText(selected.prompt);
     if (!activeAutomation(token)) return;
     if (!sent) {
@@ -4787,9 +5094,9 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     run.reason = selected.probeId
       ? `已发送探针 #${run.attempt}（${selected.probeId}）`
       : `已发送探针 #${run.attempt}（${selected.index + 1}/${selected.total}）`;
-    automationBeginRound('PROBE', 0);
     automationPersist();
     save();
+    if (run.thinking.state === 'SEEN') void automationRun({ kind: 'THOUGHT', sid: created.sid, trigger: 'STREAM_BOUND', markers: run.thinking.markers });
     automationScheduleCostRead(created.sid, automationTiming.costGapMs);
     automationNotify(`已发送轮换探针 #${run.attempt}：${automationProbeShortLabel(selected)}`);
   }
@@ -4894,12 +5201,13 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     save();
     await automationRun({ kind: 'RESUME', sid, trigger: 'RESUME', allowPaused: true });
     // 恢复后**按新规则**继续：只有 KEEP（阶段仍在 RUNNING/PROBING）才续发；已归档/已暂停一律不动。
-    if (['RUNNING', 'PROBING'].includes(run.phase) && run.owned === true && run.sessionId === sid) {
+    if (['RUNNING', 'PROBING'].includes(run.phase) && run.owned === true && run.sessionId === sid
+      && run.decision === 'KEEP' && run.rounds && run.rounds.outputComplete && run.rounds.billingReady) {
       const total = Math.max(0, Math.floor(automationNumber(config.rounds, 0) || 0));
       const done = Number(run.completedRounds) || 0;
       const kind = run.rounds && run.rounds.kind === 'TASK' ? 'TASK' : 'PROBE';
       if (kind === 'TASK') {
-        if (done < total && !automationAutoSendBlock()) scheduleRound(done + 1);
+        if (done < total && !automationRoundPending() && !automationAutoSendBlock()) scheduleRound(done + 1);
       } else {
         automationScheduleCostRead(sid, automationTiming.costGapMs);
       }
@@ -4911,7 +5219,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   async function automationApplyPoolChange() {
     automationEnsureState();
     clearTimeout(roundTimer); roundTimer = null;
-    if (run.rounds) run.rounds.pending = false;
+    if (run.rounds && run.rounds.outputComplete && run.rounds.billingReady) run.rounds.pending = false;
     run.pendingRound = 0;
     run.poolChangeCount = (Number(run.poolChangeCount) || 0) + 1;
     // 池是本批锁定的两样东西之一 ⇒ 换池就换锁：**只重锁池，探针上限与 charged 上限原样不动**。
@@ -4940,7 +5248,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     clearTimeout(roundTimer); roundTimer = null;
     clearTimeout(costTimer); costTimer = null;
     clearTimeout(probeTimer); probeTimer = null;
-    if (run.rounds) run.rounds.pending = false;
+    if (run.rounds && run.rounds.outputComplete && run.rounds.billingReady) run.rounds.pending = false;
     run.pendingRound = 0;
     run.phase = 'PAUSED';
     run.reason = 'SWITCH_CHANGED';
@@ -5006,6 +5314,8 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     void automationRun({
       kind: 'COST', sid, evidence: evidence || null,
       status: info.status === undefined ? null : info.status,
+      costRequestedAt: info.requestedAt || Date.now(),
+      roundToken: info.roundToken, automationToken: info.automationToken,
       trigger: 'COST',
     });
   }
@@ -5015,8 +5325,8 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     void automationRun({
       kind: 'THOUGHT', sid,
       markers: Array.isArray(markers) ? markers.slice() : [],
-      // ★ R2：命中来源（20-network.js 的 think 流扫描 = 'sse'）。
-      source: typeof source === 'string' && source ? source : 'sse',
+      // ★ R2：命中来源（页面上渲染出来的 thinking 标签 = 'dom'，本版唯一通道）。
+      source: typeof source === 'string' && source ? source : 'dom',
       trigger: 'THOUGHT',
     });
   }
@@ -5184,7 +5494,12 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     normalizeThinkingMode: automationNormalizeThinkingMode,
     settleThinking: automationSettleThinking,
     beginRound: automationBeginRound,
+    streamRecord: automationStreamRecord, streamStart: automationStreamStart, streamEvent: automationStreamEvent, billReady: automationBillReady,
     recordThoughtMarkers: automationRecordThoughtMarkers,
+    // ★ DOM 判据（唯一思考通道）：读页面标签 + 手动跑一次扫描（离线测试注入假 DOM 后驱动）。
+    domThinkingLabel: automationDomThinkingLabel,
+    sweepDomThinking: automationSweepDomThinking,
+    domThinkingHits: () => domThinkingHits,
     // 注入假实现 / 调时序
     timing: automationTiming,
     setFetchCostOnce(fn) { automationFetchCostOnce = fn; },
@@ -5927,29 +6242,23 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   /** 帮助文案（推荐用法；不含任何身份断言）。 */
   function targetPoolHelpText() {
     return [
-      '帮助：',
-      '  · 名单是固定的（4 个贵模型，含 agent + text 两面），不用也不能自己选。',
-      '  · 命中即保留；未命中（有有效费用证据但对不上名单）自动归档；**无费用证据则暂停、不归档**（证据待定时等待，配置异常时暂停）。',
-      '  · ★ 恒定规则（R2）：一旦观测到思考流（reasoning / thinking / thought 事件）就立刻中断生成并归档，不受「思考流要求」三档影响。回退点 = 常量 AUTOMATION_THINKING_ALWAYS_ARCHIVE=false（parts/30-automation.js）。',
-      '  · 想换名单：改 data/target-pool-presets.json 与 parts/15-state.js 的内嵌表（两者必须逐条相等）。',
-      '  · 更省的路子：先用历史报告就地重判 → 再有限探测（重判不发消息、不花钱）。',
+      '筛选规则：',
+      '  · 有思考：立即停止生成并排除当前会话。',
+      '  · 无思考：等输出完成和完整计价，再识别价格候选。',
+      '  · 命中目标价格候选时保留；完整证据未命中时归档。',
+      '  · 计价暂未到时等待；证据仍不可用时暂停并保留当前会话。',
+      '  · 同价模型无法区分，模型名称仅表示价格候选。',
     ].join('\n');
   }
 
-  /** 偏好文案（纯函数，只读状态）：固定筛选恒开 + 唯一可改的思考流三态。 */
+  /** 固定筛选机制文案；兼容调用参数保留。 */
   function targetPoolControlsText(state) {
-    const s = state || targetPoolState;
-    const label = THOUGHT_REQUIREMENT_LABELS[s.thoughtRequirement] || THOUGHT_REQUIREMENT_LABELS.any;
     return [
-      // ★ 折叠态那句也放进文本区：证据文件里就能读到诚实边界，不必去翻 HTML 标记。
       TARGET_POOL_COPY.collapseLine,
-      TARGET_POOL_COPY.ruleLine,
-      '',
-      TARGET_POOL_COPY.filterFixed,
-      TARGET_POOL_COPY.filterFixedNote,
-      '',
-      TARGET_POOL_COPY.thoughtName + '：' + label + '（不管 / 要 / 不要）',
-      TARGET_POOL_COPY.thoughtNote,
+      '筛选机制（固定）：',
+      '有思考：立即停止生成并排除当前会话。',
+      '无思考：等输出完成和完整计价，再识别价格候选。',
+      '计价尚未就绪时等待；证据仍不可用时暂停并保留。',
     ].join('\n');
   }
 
@@ -6093,6 +6402,8 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   function targetPoolCurrentReport() {
     try {
       if (typeof identifyView === 'undefined' || !identifyView) return null;
+      const sid = typeof currentSessionId === 'function' ? currentSessionId() : run.sessionId;
+      if (sid && (!identifyView.source || identifyView.source.sid !== sid)) return null;
       return identifyView.report || null;
     } catch (_) {
       return null;
@@ -6113,6 +6424,22 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
   function renderTargetPool() {
     if (!panel || !panel.pool) return;
     if (panel.poolthought) panel.poolthought.value = targetPoolState.thoughtRequirement;
+    const sid = typeof currentSessionId === 'function' ? currentSessionId() : run.sessionId;
+    const currentSession = run.sessionId && run.sessionId === sid;
+    const currentRound = currentSession && run.rounds && typeof run.rounds === 'object';
+    if ((currentRound && (!run.rounds.outputComplete || !run.rounds.billingReady)) || (currentSession && run.thinking && run.thinking.state === 'SEEN')) {
+      const model = panelV2ModelView();
+      panel.pool.textContent = [model.stage, targetPoolControlsText(), TARGET_POOL_COPY.boundary].join('\n');
+      if (panel.pooltargets) panel.pooltargets.textContent = renderTargetPoolTargetsText(targetPoolView(null, { judgement: null }));
+      if (panel.targetcount) panel.targetcount.textContent = targetPoolCountBadgeText();
+      if (panel.poolhitlist) panel.poolhitlist.textContent = model.tone === 'excluded' ? '（已因思考排除，未按价格判定）' : '（尚未判定）';
+      if (panel.poolhits) {
+        panel.poolhits.open = false;
+        const summary = panel.poolhits.querySelector('summary');
+        if (summary) summary.textContent = model.tone === 'excluded' ? '价格候选判定已跳过' : '命中的候选 key（尚未判定）';
+      }
+      return;
+    }
     const report = targetPoolCurrentReport();
     const judgement = report ? targetPoolJudgement(report, {}) : null;
     if (judgement) {
@@ -6336,8 +6663,8 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         background:var(--ab-bg2);border-bottom:1px solid var(--ab-line);cursor:move;-webkit-user-select:none;user-select:none}
       #__arena_agent_billing_panel__ .head .title{font-weight:600;font-size:12px;white-space:nowrap}
       #__arena_agent_billing_panel__ .head .state{flex:0 0 auto;font-size:11px;font-weight:600;padding:1px 5px;border-left:3px solid var(--ab-line);white-space:nowrap}
-      #__arena_agent_billing_panel__ .head .heads{flex:1 1 auto;min-width:0;font-size:11px;color:var(--ab-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-      #__arena_agent_billing_panel__ .head .acts{flex:0 0 auto;display:flex;gap:4px}
+      #__arena_agent_billing_panel__ .heads{padding:4px 10px;font-size:11px;color:var(--ab-dim);background:var(--ab-bg2);overflow-wrap:anywhere;border-bottom:1px solid var(--ab-line)}
+      #__arena_agent_billing_panel__ .head .acts{margin-left:auto;flex:0 0 auto;display:flex;gap:4px}
       #__arena_agent_billing_panel__ .head .acts button{margin:0;padding:2px 7px;font-size:11px}
       #__arena_agent_billing_panel__ .head .fold{flex:0 0 auto;border:0;border-radius:6px;background:transparent;color:var(--ab-fg);font-size:12px;line-height:1;padding:3px 6px;margin:0;cursor:pointer}
       #__arena_agent_billing_panel__ .body{flex:1 1 auto;min-height:0;overflow:auto;padding:2px 10px 8px}
@@ -6382,27 +6709,39 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
       #__arena_agent_billing_panel__ .candlist,#__arena_agent_billing_panel__ .candrest,#__arena_agent_billing_panel__ .histlist{font-size:11px;color:var(--ab-dim)}
       #__arena_agent_billing_panel__ .candlist div,#__arena_agent_billing_panel__ .candrest div,#__arena_agent_billing_panel__ .histlist div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
       #__arena_agent_billing_panel__ pre.status{max-height:132px}
+      #__arena_agent_billing_panel__ .modelcard{flex:0 0 auto;padding:12px 12px 10px;border-bottom:1px solid var(--ab-line);background:var(--ab-bg)}
+      #__arena_agent_billing_panel__ .modellabel{font-size:11px;letter-spacing:.04em;color:var(--ab-dim)}
+      #__arena_agent_billing_panel__ .modelname{font-size:20px;font-weight:700;line-height:1.3;margin:5px 0 7px;overflow-wrap:anywhere;color:var(--ab-fg)}
+      #__arena_agent_billing_panel__ .modelstage{font-size:12px;font-weight:600;color:var(--ab-warn)}
+      #__arena_agent_billing_panel__ .modelnote{font-size:11px;line-height:1.4;color:var(--ab-dim);margin-top:4px}
+      #__arena_agent_billing_panel__ .modelcard[data-tone="candidate"] .modelstage{color:var(--ab-ok)}
+      #__arena_agent_billing_panel__ .modelcard[data-tone="excluded"] .modelstage{color:var(--ab-bad)}
+      #__arena_agent_billing_panel__ .mechanisms{flex:0 0 auto;padding:6px 10px;background:var(--ab-bg2);font-size:11px;line-height:1.5;border-bottom:1px solid var(--ab-line)}
+      #__arena_agent_billing_panel__ .mechanisms div+div{margin-top:2px}
+      #__arena_agent_billing_panel__ .candlist div,#__arena_agent_billing_panel__ .candrest div{font-size:13px;font-weight:600;line-height:1.7;color:var(--ab-fg)}
     </style><div class="box">
       <div class="head">
         <span class="title">Arena 计费筛选</span>
         <span class="headver" title="页面实际运行的脚本版本">${panelV2ScriptVersion()}</span>
         <span class="state">待开始</span>
-        <span class="heads"></span>
         <span class="acts"><button class="start">开始</button><button class="stop">暂停</button><button class="resume">继续</button></span>
         <button class="fold" title="展开 / 收起">▸</button>
       </div>
+      <div class="heads"></div>
+      <section class="modelcard" data-tone="waiting" aria-live="polite">
+        <div class="modellabel">当前会话</div>
+        <div class="modelname">模型待识别</div>
+        <div class="modelstage">等待开始探测</div>
+        <div class="modelnote">输出完成并取得完整计价后再识别。</div>
+      </section>
+      <div class="mechanisms"><div>有思考：立即停止并排除</div><div>无思考：等输出完成和完整计价，再识别</div></div>
       <p class="boundline">${TARGET_POOL_COPY.collapseLine}</p>
       <div class="body">
-      <section class="sec">
-        <label>思考流要求：不管 / 要 / 不要</label>
-        <select class="poolthought"><option value="any">不管（默认）</option><option value="require">要</option><option value="avoid">不要</option></select>
-        <pre class="poolthoughtsay">按可观测的思考流标记判断，不能证明模型内部是否推理。</pre>
-        <p class="hint thoughtfixed">★ 恒定规则（R2）：一旦观测到思考流（reasoning / thinking / thought 事件）就立刻中断生成并归档，不受上面三档影响；回退点 = 常量 AUTOMATION_THINKING_ALWAYS_ARCHIVE=false。</p>
-      </section>
       <section class="sec poolbox">
-        <div class="costhead"><span>目标模型名单（固定；命中即保留，未命中自动归档，无费用证据则暂停不归档）</span><span class="targetcount">7 条 key（固定）</span></div>
+        <details class="targetdetails"><summary>目标模型名单与计价规则 <span class="targetcount">7 条 key（固定）</span></summary>
         <pre class="pooltargetssay">名单：准备中…</pre>
         <pre class="poolmultisay">多分支价：能否命中，以实际费用判定为准。</pre>
+        </details>
       </section>
       <section class="sec">
         <div class="row"><span class="k">判定</span><span class="v decision"></span></div>
@@ -6659,13 +6998,59 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     return null;
   }
 
+  /** 当前会话模型卡：输出和本轮计价均就绪后才展示价格候选。 */
+  function panelV2ModelView() {
+    const sid = typeof currentSessionId === 'function' ? currentSessionId() : run.sessionId;
+    const active = !!run.sessionId && (!sid || run.sessionId === sid);
+    const round = active && run.rounds && typeof run.rounds === 'object' ? run.rounds : {};
+    const view = { title: '模型待识别', label: '当前会话', stage: '等待开始探测', ready: false, names: [], note: '输出完成并取得完整计价后再识别。', tone: 'waiting' };
+    if (active && run.thinking && run.thinking.state === 'SEEN') {
+      return Object.assign(view, { title: '思考已排除', stage: '检测到思考，立即停止并排除', note: '本次会话不再进入价格筛选。', tone: 'excluded' });
+    }
+    if (active && !round.outputComplete) {
+      view.stage = '等待输出完成';
+      return view;
+    }
+    if (active && round.outputComplete && !round.billingReady) {
+      view.stage = run.phase === 'PAUSED' ? '计价未到，已暂停' : '等待本轮完整计价';
+      return view;
+    }
+    const src = typeof identifyView === 'object' && identifyView ? identifyView.source : null;
+    const report = targetPoolCurrentReport();
+    if (!active || !round.billingReady || !src || src.sid !== sid || !report) {
+      if (sid) view.stage = '等待当前会话计价';
+      return view;
+    }
+    const names = Array.from(new Set((Array.isArray(report.complete) ? report.complete : [])
+      .filter((row) => row && typeof row === 'object' && row.key)
+      .map((row) => String(row.disp || row.label || row.key))));
+    if (!names.length) {
+      return Object.assign(view, { title: '暂无法识别', label: '价格识别结果', stage: '完整计价已到，暂无可验证候选', ready: true, note: '本次价格证据未能识别模型候选。', tone: 'unresolved' });
+    }
+    return Object.assign(view, {
+      title: names.slice(0, 2).join(' / ') + (names.length > 2 ? ' 等 ' + names.length + ' 个' : ''),
+      label: '价格候选 · ' + names.length + ' 个', names, ready: true,
+      stage: run.decision === 'KEEP' ? '目标价格兼容，已保留' : run.decision === 'ARCHIVE' ? '价格未命中目标，已排除' : '计价就绪，已识别价格候选',
+      note: names.length > 1 ? '费用证据仍兼容多个候选，同价时无法区分。' : '价格匹配不代表模型身份已确认。',
+      tone: run.decision === 'ARCHIVE' ? 'excluded' : 'candidate',
+    });
+  }
+
   /** 候选清单：默认只显前 5 条（其余靠「查看全部候选（N）」），长文本一律省略号。 */
   function panelV2RenderCandidates() {
     if (!panel || !panel.candlist) return;
+    const model = panelV2ModelView();
+    if (!model.ready) {
+      panel.candlist.innerHTML = '<div>' + model.stage + '</div>';
+      if (panel.candrest) { panel.candrest.innerHTML = ''; panel.candrest.hidden = true; }
+      if (panel.candmore) panel.candmore.hidden = true;
+      if (panel.candtotal) panel.candtotal.textContent = model.tone === 'excluded' ? '已排除' : '等待完整证据';
+      return;
+    }
     const report = targetPoolCurrentReport();
     const rows = (report && Array.isArray(report.complete) ? report.complete : [])
       .filter((row) => row && typeof row === 'object' && typeof row.key === 'string' && row.key);
-    const line = (row) => (row.disp ? row.disp + ' — ' : '') + row.key;
+    const line = (row) => String(row.disp || row.label || row.key);
     let preview = null;
     try { if (typeof automationCandidatesPreview === 'function') preview = automationCandidatesPreview(report, 5); } catch (_) {}
     if (!preview) {
@@ -6678,7 +7063,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
         collapseLabel: '收起候选',
       };
     }
-    const first = preview.lines || [];
+    const first = rows.slice(0, 5).map(line);
     const rest = rows.slice(5);
     panel.candlist.innerHTML = first.length
       ? first.map((t) => '<div>' + String(t).replace(/[<>&]/g, '') + '</div>').join('')
@@ -6712,6 +7097,12 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     if (!panel) return false;
     try {
       const collapsed = panelV2State.collapsed === true;
+      const model = panelV2ModelView();
+      if (panel.modelname) panel.modelname.textContent = model.title;
+      if (panel.modellabel) panel.modellabel.textContent = model.label;
+      if (panel.modelstage) panel.modelstage.textContent = model.stage;
+      if (panel.modelnote) panel.modelnote.textContent = model.note;
+      if (panel.modelcard && panel.modelcard.dataset) panel.modelcard.dataset.tone = model.tone;
       // ① 顶部操作栏：状态短语始终可见；折叠态额外显示「状态｜模式·池｜余M」一行摘要。
       if (panel.state) {
         panel.state.textContent = panelV2StatusPhrase();
@@ -6719,12 +7110,12 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
       }
       if (panel.heads) {
         panel.heads.textContent = panelV2SummaryText();
-        panel.heads.hidden = !collapsed;
+        panel.heads.hidden = false;
       }
       // ④ 判定 / 命名 / 候选
       const verdict = panelV2VerdictLines();
-      if (panel.decision) panel.decision.textContent = verdict.decision;
-      if (panel.nameline) panel.nameline.textContent = verdict.name;
+      if (panel.decision) panel.decision.textContent = model.ready ? verdict.decision : model.stage;
+      if (panel.nameline) panel.nameline.textContent = model.ready ? verdict.name : '识别后命名';
       if (panel.targetcount) {
         // ★ 徽标恒为「N 条 key（固定）」（N = 固定名单条数 = 7）—— 不再显示会变的自动化简称，
         //   免得折叠态出现"静态写 7、动态写目标7"这种自相矛盾。
@@ -6807,6 +7198,11 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     panelV2Expanded = false;
     panelV2Notice = null;
     panel.body = host.querySelector('.body');
+    panel.modelcard = host.querySelector('.modelcard');
+    panel.modellabel = host.querySelector('.modellabel');
+    panel.modelname = host.querySelector('.modelname');
+    panel.modelstage = host.querySelector('.modelstage');
+    panel.modelnote = host.querySelector('.modelnote');
     panel.status = host.querySelector('.status');
     panel.probe = host.querySelector('.probe');
     panel.rounds = host.querySelector('.rounds');
@@ -6985,6 +7381,20 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     if (!panel || !panel.identify) return;
     const isCurrent = identifyView.source && identifyView.source.sid === currentSessionId();
     if (panel.export) panel.export.disabled = !isCurrent;
+    const currentRun = typeof run === 'object' && run && run.owned === true && run.sessionId === currentSessionId();
+    const round = currentRun && run.rounds && typeof run.rounds === 'object' ? run.rounds : null;
+    const thinkingSeen = currentRun && run.thinking && run.thinking.state === 'SEEN';
+    if (thinkingSeen || (round && (!round.outputComplete || !round.billingReady))) {
+      let stage = thinkingSeen ? '检测到思考，立即停止并排除' : !round.outputComplete ? '等待输出完成' : '等待本轮完整计价';
+      try {
+        if (typeof panelV2ModelView === 'function') {
+          const model = panelV2ModelView();
+          if (model && typeof model.stage === 'string') stage = model.stage;
+        }
+      } catch (_) {}
+      panel.identify.textContent = '识别：' + stage + (thinkingSeen ? '\n本次会话不再进入价格筛选。' : '\n输出完成并取得本轮完整计价后，再显示价格候选。');
+      return;
+    }
     const tail = [];
     if (identifyView.err) tail.push('识别失败：' + identifyView.err);
     if (identifyView.lastExport) {
@@ -7246,6 +7656,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     // 不在 battle/首页写 feature flag，也不注入自动化面板；油猴脚本只服务 Agent。
     if (!/^\/agent(?:\/|$)/.test(location.pathname)) return;
     enableBillingFlag();
+    automationWatchDomThinking();
     const ready = () => { if (!document.getElementById('__arena_agent_billing_panel__')) createPanel(); };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ready, { once: true });
     else ready();
@@ -7265,6 +7676,13 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
     start: startAutomation,
     stop: stopAutomation,
     scanThoughtSignals,
+    // ★ 思考判据（2026-10-11 起 = 页面 DOM，不再是流量）：真机上可直接复核
+    //   「页面此刻算不算正在思考」以及手动跑一次扫描。
+    thinking: {
+      domLabel: automationDomThinkingLabel,
+      sweep: automationSweepDomThinking,
+      watch: automationWatchDomThinking,
+    },
     classify,
     enableBillingFlag,
     // 内嵌内核识别（与 CLI 同源）：只读接口 + 纯函数，便于在页面控制台复核与自动化测试。
