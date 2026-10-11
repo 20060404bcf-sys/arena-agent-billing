@@ -6667,7 +6667,7 @@ function buildBoundary({ report, std, longCtx, rows, unpriced, rejected, derived
       #__arena_agent_billing_panel__ pre.status{max-height:132px}
     </style><div class="box">
       <div class="head">
-        <span class="title">Arena 计费筛选</span><span class="titlever" title="脚本运行版本">${"v" + ((typeof __IDENTIFY_BUILD__ !== "undefined" && __IDENTIFY_BUILD__ && __IDENTIFY_BUILD__.scriptVersion) || "?")}</span>
+        <span class="title">Arena 计费筛选</span>
         <span class="headver" title="页面实际运行的脚本版本">${panelV2ScriptVersion()}</span>
         <span class="state">待开始</span>
         <span class="heads"></span>
